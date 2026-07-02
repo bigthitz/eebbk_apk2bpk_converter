@@ -1,79 +1,95 @@
-name: Build apk2bpk
+name: Build apk2bpk Tool
 on:
   push:
-    branches: [main, master]
+    branches: [ main, master ]
   pull_request:
-    branches: [main, master]
+    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
-  # Windows x64 exe 编译（MSYS2 稳定方案，替代失效的 ilammy/setup-mingw）
+  # Windows x64 EXE (MSYS2)
   build-windows:
     runs-on: windows-latest
     defaults:
       run:
         shell: msys2 {0}
     steps:
-      - name: Checkout source code
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Setup MSYS2 + MinGW-w64 GCC + make
+      - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
           update: true
           install: mingw-w64-ucrt-x86_64-gcc make
 
-      - name: Make 编译 Windows exe
+      - name: Build
         run: make
 
-      - name: 上传 Windows 编译产物
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: windows-apk2bpk
+          name: windows-x64
           path: apk2bpk.exe
 
-  # Linux x86_64 静态二进制
-  build-linux:
+  # Linux x86_64 PC
+  build-linux-x64:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout source code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: 安装编译依赖
-        run: |
-          sudo apt update
-          sudo apt install -y make gcc clang
+      - name: Install build tools
+        run: sudo apt update && sudo apt install make gcc -y
 
-      - name: Make 编译 Linux 程序（强制使用gcc）
+      - name: Compile
         run: make CC=gcc
 
-      - name: 上传 Linux 编译产物
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: linux-apk2bpk
+          name: linux-x64
           path: apk2bpk
 
-  # 打v开头tag自动打包Release下载包
+  # ARM64 Linux (Termux/手机)
+  build-linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt update && sudo apt install make gcc -y
+
+      - name: Compile ARM64 binary
+        run: make CC=gcc
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64-termux
+          path: apk2bpk
+
+  # 打版本标签自动打包Release压缩包
   release-package:
-    needs: [build-windows, build-linux]
+    needs: [build-windows, build-linux-x64, build-linux-arm64]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - name: 下载所有编译文件
+      - name: Download all binaries
         uses: actions/download-artifact@v4
 
-      - name: 打包压缩包
+      - name: Organize files
         run: |
-          mkdir build_out
-          mv windows-apk2bpk/apk2bpk.exe build_out/
-          mv linux-apk2bpk/apk2bpk build_out/
-          zip apk2bpk-tool.zip build_out/*
+          mkdir dist
+          mv windows-x64/apk2bpk.exe dist/
+          mv linux-x64/apk2bpk dist/apk2bpk-x64
+          mv linux-arm64-termux/apk2bpk dist/apk2bpk-arm64-termux
+          zip apk2bpk-all.zip dist/*
 
-      - name: 创建GitHub Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          files: apk2bpk-tool.zip
+          files: apk2bpk-all.zip
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
