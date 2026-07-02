@@ -1,5 +1,4 @@
 name: Build apk2bpk
-# 触发条件：推送代码、PR、手动运行
 on:
   push:
     branches: [main, master]
@@ -8,20 +7,27 @@ on:
   workflow_dispatch:
 
 jobs:
-  # Windows 编译 x64 exe
+  # Windows x64 exe 编译（MSYS2 稳定方案，替代失效的 ilammy/setup-mingw）
   build-windows:
     runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
 
-      - name: Setup MinGW-w64
-        uses: ilammy/setup-mingw@v2
+      - name: Setup MSYS2 + MinGW-w64 GCC + make
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-gcc make
 
-      - name: Build with make
+      - name: Make 编译 Windows exe
         run: make
 
-      - name: Upload Windows artifact
+      - name: 上传 Windows 编译产物
         uses: actions/upload-artifact@v4
         with:
           name: windows-apk2bpk
@@ -34,41 +40,40 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - name: 安装编译依赖
         run: |
           sudo apt update
           sudo apt install -y make gcc clang
 
-      - name: Build with make (force use gcc)
+      - name: Make 编译 Linux 程序（强制使用gcc）
         run: make CC=gcc
 
-      - name: Upload Linux artifact
+      - name: 上传 Linux 编译产物
         uses: actions/upload-artifact@v4
         with:
           name: linux-apk2bpk
           path: apk2bpk
 
-  # 可选：打 tag 自动打包 Release 发布
+  # 打v开头tag自动打包Release下载包
   release-package:
     needs: [build-windows, build-linux]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - name: Download all compiled binaries
+      - name: 下载所有编译文件
         uses: actions/download-artifact@v4
 
-      - name: Package zip archive
+      - name: 打包压缩包
         run: |
           mkdir build_out
           mv windows-apk2bpk/apk2bpk.exe build_out/
           mv linux-apk2bpk/apk2bpk build_out/
           zip apk2bpk-tool.zip build_out/*
 
-      - name: Create GitHub Release
+      - name: 创建GitHub Release
         uses: softprops/action-gh-release@v1
         with:
           files: apk2bpk-tool.zip
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
