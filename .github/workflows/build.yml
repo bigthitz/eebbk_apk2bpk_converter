@@ -1,0 +1,74 @@
+name: Build apk2bpk
+# 触发条件：推送代码、PR、手动运行
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  # Windows 编译 x64 exe
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Setup MinGW-w64
+        uses: ilammy/setup-mingw@v2
+
+      - name: Build with make
+        run: make
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-apk2bpk
+          path: apk2bpk.exe
+
+  # Linux x86_64 静态二进制
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y make gcc clang
+
+      - name: Build with make (force use gcc)
+        run: make CC=gcc
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-apk2bpk
+          path: apk2bpk
+
+  # 可选：打 tag 自动打包 Release 发布
+  release-package:
+    needs: [build-windows, build-linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all compiled binaries
+        uses: actions/download-artifact@v4
+
+      - name: Package zip archive
+        run: |
+          mkdir build_out
+          mv windows-apk2bpk/apk2bpk.exe build_out/
+          mv linux-apk2bpk/apk2bpk build_out/
+          zip apk2bpk-tool.zip build_out/*
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: apk2bpk-tool.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
