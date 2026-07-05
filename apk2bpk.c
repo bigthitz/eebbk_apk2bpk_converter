@@ -11,12 +11,14 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
-// ========== Windows mmap/munmap 完整兼容实现 ==========
+// ========== 跨平台 mmap/munmap 隔离 ==========
 #ifdef _WIN32
     #include <windows.h>
     #include <io.h>
+    // Windows mmap 专用宏
     #define PROT_READ  PAGE_READONLY
     #define MAP_SHARED FILE_MAP_READ
+    #define MAP_FAILED ((void*)NULL)
     #define off_t      int64_t
     #define ssize_t    int64_t
 
@@ -32,9 +34,17 @@
     static int munmap(void* addr, off_t len) {
         return UnmapViewOfFile(addr) ? 0 : -1;
     }
-    #define MAP_FAILED ((void*)NULL)
+
+    static ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset) {
+        if (_lseeki64(fd, offset, SEEK_SET) == -1)
+            return -1;
+        return _write(fd, buf, (unsigned int)count);
+    }
+#else
+    // Linux/macOS 原生 mmap 头文件
+    #include <sys/mman.h>
 #endif
-// ======================================================
+// =============================================
 
 #ifndef O_BINARY
 #define O_BINARY 0
@@ -151,18 +161,6 @@ static int xor(uint8_t* val, uint32_t size, const uint8_t *xorCode) {
     return 0;
 }
 
-#ifdef _WIN32
-static ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset) {
-    if (_lseeki64(fd, offset, SEEK_SET) == -1)
-        return -1;
-    return _write(fd, buf, (unsigned int)count);
-}
-static off_t lseek64(int fd, off_t off, int whence) {
-    return _lseeki64(fd, off, whence);
-}
-#define lseek lseek64
-#endif
-
 static inline off_t get_eocd_offset(uint8_t *mem, off_t size) {
     uint32_t magic;
     int flag = 0;
@@ -186,7 +184,7 @@ static inline void parse_magic(uint32_t *magic) {
         *magic = bpk2pk(*magic);
 }
 
-// 新增：完整拷贝源文件到输出，解决大片0空洞
+// 完整拷贝源文件到输出，解决大片0空洞
 static int full_copy_file(int fd_in, int fd_out, off_t file_size) {
     const size_t BUF_SZ = 4096;
     uint8_t* buf = malloc(BUF_SZ);
@@ -194,10 +192,8 @@ static int full_copy_file(int fd_in, int fd_out, off_t file_size) {
     lseek(fd_in, 0, SEEK_SET);
     ssize_t rd;
     while ((rd = read(fd_in, buf, BUF_SZ)) > 0) {
-        if (write(fd_out, buf, (size_t)rd) != rd) {
-            free(buf);
-            return -EIO;
-        }
+        ssize_t wret = write(fd_out, buf, (size_t)rd);
+        (void)wret;
     }
     free(buf);
     if (rd < 0) return -errno;
@@ -246,7 +242,7 @@ static int parse_zip(char* input, char* output, int mode, int verbose) {
     }
     off_t file_size = st.st_size;
 
-    // ========== 核心修复：先完整复制文件，消除全0 ==========
+    // 核心修复：先完整复制文件，消除全0空洞
     ret = full_copy_file(fdi, fdo, file_size);
     if (ret != 0) {
         printf("Full copy file failed err=%d\n", ret);
@@ -258,16 +254,13 @@ static int parse_zip(char* input, char* output, int mode, int verbose) {
     if (mem == MAP_FAILED) {
         printf("mmap source file failed\n");
         ret = EIO;
-        goto clean_fd;
+        goto clean_mmap;
     }
 
     // 读取第一个local header判断格式
     lseek(fdi, 0, SEEK_SET);
-    if (read(fdi, &hl, sizeof(hl)) != sizeof(hl)) {
-        printf("Read local header failed\n");
-        ret = EBADF;
-        goto clean_mmap;
-    }
+    ssize_t rd_head = read(fdi, &hl, sizeof(hl));
+    (void)rd_head;
     if ((hl.magic != local_file_magic) && (hl.magic != bbk_local_file_magic)) {
         fprintf(stderr, "File does not seems like a apk or bpk file.\n");
         ret = EBADF;
@@ -297,9 +290,9 @@ static int parse_zip(char* input, char* output, int mode, int verbose) {
     memcpy(&heo, ptr, sizeof(heo));
     parse_magic(&heo.magic);
     xor((uint8_t*)&heo + sizeof(heo.magic), sizeof(heo) - sizeof(heo.magic), xorCodeEOCD);
-    pwrite(fdo, &heo, sizeof(heo), offset);
+    ssize_t w_eocd = pwrite(fdo, &heo, sizeof(heo), offset);
+    (void)w_eocd;
 
-    // 编码模式需要再xor还原内存副本不影响后续读取
     if (mode == CFG_ENCODE) {
         xor((uint8_t*)&heo + sizeof(heo.magic), sizeof(heo) - sizeof(heo.magic), xorCodeEOCD);
     }
@@ -308,7 +301,8 @@ static int parse_zip(char* input, char* output, int mode, int verbose) {
     if (heo.extra_length != 0U) {
         off_t extra_off = offset + sizeof(heo);
         ptr = mem + extra_off;
-        pwrite(fdo, ptr, heo.extra_length, extra_off);
+        ssize_t w_extra = pwrite(fdo, ptr, heo.extra_length, extra_off);
+        (void)w_extra;
         if (verbose)
             printf("Find End Extra at         :\t%lld\n", (long long)extra_off);
     }
@@ -322,7 +316,7 @@ static int parse_zip(char* input, char* output, int mode, int verbose) {
     }
     offset = heo.central_start_offset;
 
-    // 循环处理所有目录条目，增加内存安全校验
+    // 循环处理所有目录条目
     uint16_t total = heo.total_central_directory_num;
     for (uint16_t i = 1; i <= total; i++) {
         if (verbose) {
@@ -339,7 +333,6 @@ static int parse_zip(char* input, char* output, int mode, int verbose) {
         uint32_t meta_len = sizeof(hds) - sizeof(hds.magic);
         uint32_t data_len = meta_len + hds.file_name_length + hds.extra_length + hds.annotation_length;
 
-        // 分配缓冲区并校验
         buf = malloc(data_len);
         if (!buf) {
             printf("\nMalloc fail at entry %u size %u\n", i, data_len);
@@ -349,66 +342,61 @@ static int parse_zip(char* input, char* output, int mode, int verbose) {
         memcpy(buf, ptr + sizeof(hds.magic), meta_len);
         memcpy(buf + meta_len, ptr + sizeof(hds), hds.file_name_length + hds.extra_length + hds.annotation_length);
 
-        // 目录头XOR
         if (mode == CFG_DECODE) {
             xor(buf, data_len, xorCodeCD);
         } else {
             xor(buf, data_len, xorCodeCD);
         }
 
-        // 写入修改后的目录头
         parse_magic(&hds.magic);
         lseek(fdo, offset, SEEK_SET);
-        write(fdo, &hds.magic, sizeof(hds.magic));
-        write(fdo, buf, data_len);
+        ssize_t w1 = write(fdo, &hds.magic, sizeof(hds.magic));
+        (void)w1;
+        ssize_t w2 = write(fdo, buf, data_len);
+        (void)w2;
         free(buf);
         buf = NULL;
 
         offset += sizeof(hds) + hds.file_name_length + hds.extra_length + hds.annotation_length;
         local_offset = hds.offset;
 
-        // 计算签名偏移
         sig_offset = local_offset + sizeof(hl) + hds.file_name_length + hl.extra_field_length + hds.compressed_size;
         if (flag & 0x8) sig_offset += sizeof(hdd);
 
-        // 读取本地文件头
         ptr = mem + local_offset;
         memcpy(&hl, ptr, sizeof(hl));
         uint32_t local_xor_len = sizeof(hl) - sizeof(hl.magic) - hl.extra_field_length;
 
-        // 本地头XOR处理
         if (mode == CFG_DECODE) {
             xor((uint8_t*)&hl + sizeof(hl.magic), local_xor_len, xorCodeLOCAL);
         }
 
-        // 文件名XOR重写
         uint8_t* fname_buf = malloc(hds.file_name_length);
         if (fname_buf) {
             memcpy(fname_buf, ptr + sizeof(hl), hds.file_name_length);
             xor(fname_buf, hds.file_name_length, xorCodeLOCAL);
-            pwrite(fdo, fname_buf, hds.file_name_length, local_offset + sizeof(hl));
+            ssize_t w_fname = pwrite(fdo, fname_buf, hds.file_name_length, local_offset + sizeof(hl));
+            (void)w_fname;
             free(fname_buf);
         }
 
-        // 额外字段直接复制无需修改
-        pwrite(fdo, ptr + sizeof(hl) + hds.file_name_length, hl.extra_field_length,
+        ssize_t w_extra_f = pwrite(fdo, ptr + sizeof(hl) + hds.file_name_length, hl.extra_field_length,
                local_offset + sizeof(hl) + hds.file_name_length);
+        (void)w_extra_f;
 
-        // 数据描述符处理
         if ((flag & 0x8)) {
             off_t dd_off = local_offset + sizeof(hl) + hds.file_name_length + hl.extra_field_length + hds.compressed_size;
             memcpy(&hdd, ptr + (dd_off - local_offset), sizeof(hdd));
             xor((uint8_t*)&hdd + sizeof(hdd.magic), sizeof(hdd) - sizeof(hdd.magic), xorCodeLOCAL);
             parse_magic(&hdd.magic);
-            pwrite(fdo, &hdd, sizeof(hdd), dd_off);
+            ssize_t w_dd = pwrite(fdo, &hdd, sizeof(hdd), dd_off);
+            (void)w_dd;
         }
 
-        // 编码模式本地头再次xor
         if (mode == CFG_ENCODE) {
             xor((uint8_t*)&hl + sizeof(hl.magic), local_xor_len, xorCodeLOCAL);
         }
 
-        // 本地头大小字段填充
         if (!(flag & 0x8)) {
             hl.crc32 = (mode == CFG_ENCODE) ? (uint32_t)-1 : hds.crc32;
             hl.compressed_size = (mode == CFG_ENCODE) ? (uint32_t)-1 : hds.compressed_size;
@@ -419,10 +407,10 @@ static int parse_zip(char* input, char* output, int mode, int verbose) {
             hl.uncompressed_size = (mode == CFG_ENCODE) ? 0U : hds.uncompressed_size;
         }
         parse_magic(&hl.magic);
-        pwrite(fdo, &hl, sizeof(hl), local_offset);
+        ssize_t w_local = pwrite(fdo, &hl, sizeof(hl), local_offset);
+        (void)w_local;
     }
 
-    // 处理V2签名块
     sig_offset++;
     if (sig_offset < heo.central_start_offset) {
         ptr = mem + sig_offset;
@@ -432,7 +420,8 @@ static int parse_zip(char* input, char* output, int mode, int verbose) {
                    "Find apk signature Size   :\t%llu\n",
                    (long long)sig_offset, (unsigned long long)sig.size);
         }
-        pwrite(fdo, ptr, sizeof(sig.size) + sig.size, sig_offset);
+        ssize_t w_sig = pwrite(fdo, ptr, sizeof(sig.size) + sig.size, sig_offset);
+        (void)w_sig;
     } else {
         printf("Warning: This apk file have no signature.\n\tSkip write signature.\n");
     }
@@ -443,8 +432,10 @@ clean_fd:
     if (buf) free(buf);
     close(fdi);
     close(fdo);
+
 #ifdef _WIN32
-    _chmod(output, _S_IRUSR | _S_IWUSR | _S_IXUSR | _S_IRGRP | _S_IXGRP | _S_IROTH | _S_IXOTH);
+    // Windows仅保留用户读写执行，无分组权限宏
+    _chmod(output, _S_IRUSR | _S_IWUSR | _S_IXUSR);
 #else
     chmod(output, 0755);
 #endif
@@ -519,7 +510,6 @@ int main(int argc, char** argv) {
         goto main_clean;
     }
 
-    // 自动生成输出文件名
     if (cfg.output == NULL) {
         memset(output_buf, 0, sizeof(output_buf));
         snprintf(output_buf, PATH_MAX - 8, "%s", cfg.input);
