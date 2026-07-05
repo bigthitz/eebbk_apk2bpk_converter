@@ -15,7 +15,6 @@
 #ifdef _WIN32
     #include <windows.h>
     #include <io.h>
-    // Windows mmap 专用宏
     #define PROT_READ  PAGE_READONLY
     #define MAP_SHARED FILE_MAP_READ
     #define MAP_FAILED ((void*)NULL)
@@ -41,7 +40,6 @@
         return _write(fd, buf, (unsigned int)count);
     }
 #else
-    // Linux/macOS 原生 mmap 头文件
     #include <sys/mman.h>
 #endif
 // =============================================
@@ -184,7 +182,6 @@ static inline void parse_magic(uint32_t *magic) {
         *magic = bpk2pk(*magic);
 }
 
-// 完整拷贝源文件到输出，解决大片0空洞
 static int full_copy_file(int fd_in, int fd_out, off_t file_size) {
     const size_t BUF_SZ = 4096;
     uint8_t* buf = malloc(BUF_SZ);
@@ -211,7 +208,6 @@ static int parse_zip(char* input, char* output, int mode, int verbose) {
     off_t offset = 0, local_offset = 0, sig_offset = 0;
     uint8_t *buf = NULL;
 
-    // 删除旧输出文件
     if (access(output, F_OK) == 0) {
         if (remove(output)) {
             printf("Error: Cannot remove file %s, errno=%d\n", output, errno);
@@ -219,13 +215,11 @@ static int parse_zip(char* input, char* output, int mode, int verbose) {
         }
     }
 
-    // 打开输入只读
     fdi = open(input, O_RDONLY | O_BINARY);
     if (fdi < 0) {
         printf("Error open input %s errno=%d\n", input, errno);
         return EIO;
     }
-    // 创建输出文件
     fdo = open(output, O_CREAT | O_RDWR | O_BINARY, 0644);
     if (fdo < 0) {
         printf("Error create output %s errno=%d\n", output, errno);
@@ -233,7 +227,6 @@ static int parse_zip(char* input, char* output, int mode, int verbose) {
         return EIO;
     }
 
-    // 获取源文件大小
     struct stat st;
     if (stat(input, &st) < 0) {
         printf("stat input failed errno=%d\n", errno);
@@ -242,14 +235,12 @@ static int parse_zip(char* input, char* output, int mode, int verbose) {
     }
     off_t file_size = st.st_size;
 
-    // 核心修复：先完整复制文件，消除全0空洞
     ret = full_copy_file(fdi, fdo, file_size);
     if (ret != 0) {
         printf("Full copy file failed err=%d\n", ret);
         goto clean_fd;
     }
 
-    // 内存映射源文件用于读取解析
     uint8_t *mem = mmap(NULL, file_size, PROT_READ, MAP_SHARED, fdi, 0);
     if (mem == MAP_FAILED) {
         printf("mmap source file failed\n");
@@ -257,7 +248,6 @@ static int parse_zip(char* input, char* output, int mode, int verbose) {
         goto clean_mmap;
     }
 
-    // 读取第一个local header判断格式
     lseek(fdi, 0, SEEK_SET);
     ssize_t rd_head = read(fdi, &hl, sizeof(hl));
     (void)rd_head;
@@ -274,7 +264,6 @@ static int parse_zip(char* input, char* output, int mode, int verbose) {
 
     printf("Converting [%s] -> [%s] ... \n", input, output);
 
-    // 查找EOCD
     offset = get_eocd_offset(mem, file_size);
     if (offset == 0) {
         printf("Error: Cannot find eocd magic\n");
@@ -285,7 +274,6 @@ static int parse_zip(char* input, char* output, int mode, int verbose) {
         printf("Find EOCD at              :\t%lld\n", (long long)offset);
     }
 
-    // 处理EOCD
     uint8_t *ptr = mem + offset;
     memcpy(&heo, ptr, sizeof(heo));
     parse_magic(&heo.magic);
@@ -297,7 +285,6 @@ static int parse_zip(char* input, char* output, int mode, int verbose) {
         xor((uint8_t*)&heo + sizeof(heo.magic), sizeof(heo) - sizeof(heo.magic), xorCodeEOCD);
     }
 
-    // EOCD附加数据
     if (heo.extra_length != 0U) {
         off_t extra_off = offset + sizeof(heo);
         ptr = mem + extra_off;
@@ -316,7 +303,6 @@ static int parse_zip(char* input, char* output, int mode, int verbose) {
     }
     offset = heo.central_start_offset;
 
-    // 循环处理所有目录条目
     uint16_t total = heo.total_central_directory_num;
     for (uint16_t i = 1; i <= total; i++) {
         if (verbose) {
@@ -335,24 +321,19 @@ static int parse_zip(char* input, char* output, int mode, int verbose) {
 
         buf = malloc(data_len);
         if (!buf) {
-            printf("\nMalloc fail at entry %u size %u\n", i, data_len);
-            ret = ENOMEM;
-            goto clean_mmap;
+            printf("\nWarning: Malloc fail entry %u size %u, skip this file\n", i, data_len);
+            offset += sizeof(hds) + hds.file_name_length + hds.extra_length + hds.annotation_length;
+            continue;
         }
         memcpy(buf, ptr + sizeof(hds.magic), meta_len);
         memcpy(buf + meta_len, ptr + sizeof(hds), hds.file_name_length + hds.extra_length + hds.annotation_length);
 
-        if (mode == CFG_DECODE) {
-            xor(buf, data_len, xorCodeCD);
-        } else {
-            xor(buf, data_len, xorCodeCD);
-        }
+        xor(buf, data_len, xorCodeCD);
 
         parse_magic(&hds.magic);
-        lseek(fdo, offset, SEEK_SET);
-        ssize_t w1 = write(fdo, &hds.magic, sizeof(hds.magic));
+        ssize_t w1 = pwrite(fdo, &hds.magic, sizeof(hds.magic), offset);
         (void)w1;
-        ssize_t w2 = write(fdo, buf, data_len);
+        ssize_t w2 = pwrite(fdo, buf, data_len, offset + sizeof(hds.magic));
         (void)w2;
         free(buf);
         buf = NULL;
@@ -360,12 +341,19 @@ static int parse_zip(char* input, char* output, int mode, int verbose) {
         offset += sizeof(hds) + hds.file_name_length + hds.extra_length + hds.annotation_length;
         local_offset = hds.offset;
 
+        // 偏移合法性校验，防止越界崩溃
+        if (local_offset >= file_size) {
+            printf("\nWarning entry %u: local offset %lld out of file range, skip\n", i, (long long)local_offset);
+            continue;
+        }
+
         sig_offset = local_offset + sizeof(hl) + hds.file_name_length + hl.extra_field_length + hds.compressed_size;
         if (flag & 0x8) sig_offset += sizeof(hdd);
 
         ptr = mem + local_offset;
         memcpy(&hl, ptr, sizeof(hl));
-        uint32_t local_xor_len = sizeof(hl) - sizeof(hl.magic) - hl.extra_field_length;
+        // 修复：完整header除magic全部参与xor，不再减extra_field_length
+        uint32_t local_xor_len = sizeof(hl) - sizeof(hl.magic);
 
         if (mode == CFG_DECODE) {
             xor((uint8_t*)&hl + sizeof(hl.magic), local_xor_len, xorCodeLOCAL);
@@ -434,7 +422,6 @@ clean_fd:
     close(fdo);
 
 #ifdef _WIN32
-    // Windows仅保留用户读写执行，无分组权限宏
     _chmod(output, _S_IRUSR | _S_IWUSR | _S_IXUSR);
 #else
     chmod(output, 0755);
