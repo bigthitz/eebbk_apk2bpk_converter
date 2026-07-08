@@ -1,6 +1,4 @@
 name: Build Exploit AArch64 Android
-
-# 触发条件：push代码、手动点击运行
 on:
   push:
     branches: [ main ]
@@ -24,11 +22,10 @@ jobs:
           unzip android-ndk-r25c-linux.zip
           echo "$PWD/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
-      - name: 编译 aarch64 静态二进制
+      - name: 编译 aarch64 静态二进制（移除-lpthread）
         run: |
-          # 编译器：aarch64-linux-android30-clang 适配安卓11
           CC=aarch64-linux-android30-clang
-          $CC exp.c -o exp_arm64 -static -lpthread -O2
+          $CC exp.c -o exp_arm64 -static -O2
 
       - name: 上传编译产物
         uses: actions/upload-artifact@v4
